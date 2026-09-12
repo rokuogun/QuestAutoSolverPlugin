@@ -1,0 +1,344 @@
+module.exports = class QuestAutoSolver {
+    constructor(meta) {
+        this.meta = meta;
+        this.interval = null;
+        this.knownQuestIds = new Set();
+        this.activeQuests = new Set(); // quest ids currently being spoofed
+        this.stores = null;
+        this.subscribedFns = [];
+        this.aborted = false;
+        this.originals = {}; // to restore RunningGameStore / StreamingStore patches
+        this.settings = Object.assign({
+            autoEnroll: true,
+            checkIntervalSec: 20,
+            showToasts: true
+        }, (typeof BdApi !== "undefined" ? BdApi.Data.load("QuestAutoSolver", "settings") : {}) || {});
+    }
+
+    start() {
+        this.aborted = false;
+        this.log("Started");
+        this.toast("QuestAutoSolver enabled - watching for quests", "success");
+
+        // Initial snapshot + run after short delay (let Discord load stores)
+        setTimeout(() => {
+            try {
+                this.snapshotKnownQuests();
+                this.checkForQuests(true); // run solver for any existing incomplete quests
+            } catch (e) { console.error("[QuestAutoSolver]", e); }
+        }, 5000);
+
+        // Poll for NEW quests
+        this.interval = setInterval(() => {
+            try { this.checkForQuests(false); }
+            catch (e) { console.error("[QuestAutoSolver] poll error", e); }
+        }, Math.max(10, this.settings.checkIntervalSec) * 1000);
+
+        // Also hook FluxDispatcher quest events for instant detection
+        try {
+            const { FluxDispatcher } = this.getStores();
+            if (FluxDispatcher) {
+                const handler = (e) => {
+                    // debounce a little so QuestsStore is updated
+                    setTimeout(() => { try { this.checkForQuests(false); } catch {} }, 2000);
+                };
+                ["QUESTS_FETCH_SUCCESS", "QUESTS_SEND_HEARTBEAT_SUCCESS", "QUEST_ENROLL_SUCCESS", "QUESTS_ENROLL_SUCCESS", "QUEST_UPDATE"].forEach(evt => {
+                    try {
+                        FluxDispatcher.subscribe(evt, handler);
+                        this.subscribedFns.push([evt, handler]);
+                    } catch {}
+                });
+            }
+        } catch (e) { console.warn("[QuestAutoSolver] could not subscribe to dispatcher", e); }
+    }
+
+    stop() {
+        this.aborted = true;
+        if (this.interval) clearInterval(this.interval);
+        this.interval = null;
+        try {
+            const { FluxDispatcher, RunningGameStore, ApplicationStreamingStore } = this.getStores() || {};
+            this.subscribedFns.forEach(([evt, fn]) => { try { FluxDispatcher.unsubscribe(evt, fn); } catch {} });
+            this.subscribedFns = [];
+            // restore patches if we overrode them
+            if (RunningGameStore && this.originals.getRunningGames) {
+                RunningGameStore.getRunningGames = this.originals.getRunningGames;
+                RunningGameStore.getGameForPID = this.originals.getGameForPID;
+                try { FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [], added: [], games: [] }); } catch {}
+            }
+            if (ApplicationStreamingStore && this.originals.getStreamerActiveStreamMetadata) {
+                ApplicationStreamingStore.getStreamerActiveStreamMetadata = this.originals.getStreamerActiveStreamMetadata;
+            }
+        } catch {}
+        this.activeQuests.clear();
+        this.log("Stopped and cleaned up");
+    }
+
+    getSettingsPanel() {
+        const BdApiReact = BdApi.React;
+        // Simple native panel without React to avoid version issues
+        const div = document.createElement("div");
+        div.style.padding = "10px";
+        div.style.color = "var(--text-normal)";
+        div.innerHTML = `
+            <label style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+                <input type="checkbox" id="qas-enroll" ${this.settings.autoEnroll ? "checked" : ""}/> Auto-enroll new quests (POST /quests/:id/enroll)
+            </label>
+            <label style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+                <input type="checkbox" id="qas-toast" ${this.settings.showToasts ? "checked" : ""}/> Show toast popups
+            </label>
+            <label style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+                Check interval (sec): <input type="number" id="qas-int" min="10" max="300" value="${this.settings.checkIntervalSec}" style="width:70px"/>
+            </label>
+            <button id="qas-run" class="bd-button bd-button-filled bd-button-color-brand">Run solver now</button>
+            <p style="opacity:.7;margin-top:8px">Detection = polling QuestsStore + Flux quests events. Solver = your console script, guarded so each quest only runs once.</p>
+        `;
+        div.querySelector("#qas-enroll").onchange = (e) => this.saveSetting("autoEnroll", e.target.checked);
+        div.querySelector("#qas-toast").onchange = (e) => this.saveSetting("showToasts", e.target.checked);
+        div.querySelector("#qas-int").onchange = (e) => {
+            this.saveSetting("checkIntervalSec", Math.max(10, parseInt(e.target.value) || 20));
+            if (this.interval) { clearInterval(this.interval); this.interval = setInterval(() => this.checkForQuests(false), this.settings.checkIntervalSec * 1000); }
+        };
+        div.querySelector("#qas-run").onclick = () => this.checkForQuests(true);
+        return div;
+    }
+
+    saveSetting(k, v) {
+        this.settings[k] = v;
+        try { BdApi.Data.save("QuestAutoSolver", "settings", this.settings); } catch {}
+    }
+
+    log(...a) { console.log("%c[QuestAutoSolver]", "color:#7289da;font-weight:bold", ...a); }
+    toast(msg, type = "info") {
+        if (!this.settings.showToasts) return;
+        try { BdApi.UI.showToast(msg, { type }); } catch {}
+    }
+
+    // ---------- store access (multi-build safe) ----------
+    getStores() {
+        if (this.stores?.QuestsStore) return this.stores;
+        delete window.$;
+        let wpRequire;
+        try {
+            wpRequire = window.webpackChunkdiscord_app.push([[Symbol()], {}, r => r]);
+            window.webpackChunkdiscord_app.pop();
+        } catch (e) {
+            // Fallback to BdApi webpack
+            try {
+                const QuestsStore = BdApi.Webpack.getModule(m => m?.quests instanceof Map);
+                this.stores = { QuestsStore, FluxDispatcher: BdApi.Webpack.getModule(m => m?.dispatch && m?.subscribe), api: null };
+                return this.stores;
+            } catch { throw new Error("Cannot access webpack"); }
+        }
+        const find = (pred) => {
+            try {
+                const mod = Object.values(wpRequire.c).find(pred);
+                return mod?.exports;
+            } catch { return null; }
+        };
+        const pick = (exp, ...keys) => { for (const k of keys) if (exp?.[k]) return exp[k]; return null; };
+
+        const appStreamExp = find(x => x?.exports?.A?.__proto__?.getStreamerActiveStreamMetadata);
+        const runGameExp = find(x => x?.exports?.Ay?.getRunningGames);
+        const questsExp = find(x => x?.exports?.A?.__proto__?.getQuest);
+        const channelExp = find(x => x?.exports?.A?.__proto__?.getAllThreadsForParent);
+        const guildChanExp = find(x => x?.exports?.Ay?.getSFWDefaultChannel);
+        const fluxExp = find(x => x?.exports?.h?.__proto__?.flushWaitQueue);
+        const apiExp = find(x => x?.exports?.Bo?.get);
+
+        // fallbacks for renamed minified exports (Stable/PTB/Canary drift)
+        const fluxAlt = find(x => x?.exports?.Z?.__proto__?.flushWaitQueue || x?.exports?.default?.__proto__?.flushWaitQueue);
+
+        this.stores = {
+            ApplicationStreamingStore: pick(appStreamExp, "A"),
+            RunningGameStore: pick(runGameExp, "Ay"),
+            QuestsStore: pick(questsExp, "A"),
+            ChannelStore: pick(channelExp, "A"),
+            GuildChannelStore: pick(guildChanExp, "Ay"),
+            FluxDispatcher: pick(fluxExp, "h") || pick(fluxAlt, "Z", "default"),
+            api: pick(apiExp, "Bo")
+        };
+        // BdApi fallback for api
+        if (!this.stores.api) {
+            try { this.stores.api = BdApi.Webpack.getModule(m => m?.get && m?.post && m?.put)?.exports || BdApi.Webpack.getModule(m => m?.post && m?.get); } catch {}
+        }
+        return this.stores;
+    }
+
+    snapshotKnownQuests() {
+        const { QuestsStore } = this.getStores();
+        if (!QuestsStore?.quests) return;
+        for (const q of QuestsStore.quests.values()) this.knownQuestIds.add(q.id);
+    }
+
+    async checkForQuests(runExisting = false) {
+        const { QuestsStore, api } = this.getStores();
+        if (!QuestsStore?.quests) return this.log("QuestsStore not ready yet");
+
+        const all = [...QuestsStore.quests.values()];
+        const fresh = all.filter(q => !this.knownQuestIds.has(q.id));
+        if (fresh.length) {
+            fresh.forEach(q => this.knownQuestIds.add(q.id));
+            const names = fresh.map(q => q?.config?.messages?.questName || q.id).join(", ");
+            this.log("NEW quest(s) detected:", names);
+            this.toast(`New quest detected: ${names}`, "success");
+        }
+
+        // Auto-enroll new unenrolled quests if enabled
+        if (this.settings.autoEnroll && api) {
+            for (const q of all) {
+                if (!q.userStatus?.enrolledAt && new Date(q.config.expiresAt).getTime() > Date.now()) {
+                    try {
+                        await api.post({ url: `/quests/${q.id}/enroll`, body: { location: 7 } }).catch(() =>
+                            api.post({ url: `/quests/${q.id}/enroll`, body: {} }));
+                        this.log("Auto-enrolled:", q?.config?.messages?.questName || q.id);
+                    } catch (e) { /* already enrolled / ineligible - ignore */ }
+                }
+            }
+        }
+
+        const supportedTasks = ["WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY", "WATCH_VIDEO_ON_MOBILE"];
+        const todo = all.filter(x =>
+            x.userStatus?.enrolledAt &&
+            !x.userStatus?.completedAt &&
+            new Date(x.config.expiresAt).getTime() > Date.now() &&
+            supportedTasks.some(y => Object.keys((x.config.taskConfig ?? x.config.taskConfigV2)?.tasks ?? {}).includes(y)) &&
+            !this.activeQuests.has(x.id) &&
+            (runExisting || fresh.some(f => f.id === x.id))
+        );
+
+        if (!todo.length) {
+            if (runExisting) this.log("No uncompleted quests to run");
+            return;
+        }
+        todo.forEach(q => { this.activeQuests.add(q.id); this.runSingleQuest(q); });
+    }
+
+    // ---------- your console script, adapted to run per-quest + abortable ----------
+    async runSingleQuest(quest) {
+        if (this.aborted) return;
+        const stores = this.getStores();
+        const { ApplicationStreamingStore, RunningGameStore, ChannelStore, GuildChannelStore, FluxDispatcher, api } = stores;
+        const isApp = typeof DiscordNative !== "undefined";
+        const questName = quest.config.messages.questName;
+        const taskConfig = quest.config.taskConfig ?? quest.config.taskConfigV2;
+        const supportedTasks = ["WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY", "WATCH_VIDEO_ON_MOBILE"];
+        const taskName = supportedTasks.find(x => taskConfig.tasks[x] != null);
+        const taskData = taskConfig.tasks[taskName];
+        const applicationId = quest.config.application?.id ?? taskData.applications?.[0]?.id;
+        const secondsNeeded = taskData.target;
+        let secondsDone = quest.userStatus?.progress?.[taskName]?.value ?? 0;
+        const pid = Math.floor(Math.random() * 30000) + 1000;
+        const done = () => { this.activeQuests.delete(quest.id); this.log(`Finished: ${questName}`); };
+
+        this.log(`Auto-solving "${questName}" [${taskName}] ${secondsDone}/${secondsNeeded}s`);
+        this.toast(`Auto-solving quest: ${questName} (${taskName})`, "info");
+
+        try {
+            if (taskName === "WATCH_VIDEO" || taskName === "WATCH_VIDEO_ON_MOBILE") {
+                const speed = 7;
+                let completed = false;
+                while (!this.aborted) {
+                    const remaining = Math.min(speed, secondsNeeded - secondsDone);
+                    await new Promise(r => setTimeout(r, remaining * 1000));
+                    if (this.aborted) break;
+                    const timestamp = secondsDone + speed;
+                    const res = await api.post({ url: `/quests/${quest.id}/video-progress`, body: { timestamp: Math.min(secondsNeeded, timestamp + Math.random()) } });
+                    completed = res.body.completed_at != null;
+                    secondsDone = Math.min(secondsNeeded, timestamp);
+                    this.log(`[${questName}] video ${secondsDone}/${secondsNeeded}`);
+                    if (timestamp >= secondsNeeded) break;
+                }
+                if (!completed && !this.aborted) await api.post({ url: `/quests/${quest.id}/video-progress`, body: { timestamp: secondsNeeded } });
+                this.log(`Quest completed! (${questName})`);
+                this.toast(`Quest completed: ${questName}`, "success");
+                done();
+            } else if (taskName === "PLAY_ON_DESKTOP") {
+                if (!isApp) {
+                    this.log(`"${questName}" needs the Discord desktop app (PLAY_ON_DESKTOP doesn't work in browser).`);
+                    this.toast(`"${questName}" needs desktop app`, "error");
+                    done(); return;
+                }
+                const res = await api.get({ url: `/applications/public?application_ids=${applicationId}` });
+                const appData = res.body[0];
+                const exeName = appData.executables?.find(x => x.os === "win32")?.name?.replace(">", "") ?? appData.name.replace(/[\/\\:*?"<>|]/g, "");
+                const fakeGame = {
+                    cmdLine: `C:\\Program Files\\${appData.name}\\${exeName}`,
+                    exeName, exePath: `c:/program files/${appData.name.toLowerCase()}/${exeName}`,
+                    hidden: false, isLauncher: false, id: applicationId, name: appData.name,
+                    pid, pidPath: [pid], processName: appData.name, start: Date.now(),
+                };
+                // save originals once
+                if (!this.originals.getRunningGames) {
+                    this.originals.getRunningGames = RunningGameStore.getRunningGames;
+                    this.originals.getGameForPID = RunningGameStore.getGameForPID;
+                }
+                RunningGameStore.getRunningGames = () => [fakeGame];
+                RunningGameStore.getGameForPID = (p) => [fakeGame].find(x => x.pid === p);
+                FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: RunningGameStore.getRunningGames(), added: [fakeGame], games: [fakeGame] });
+
+                const fn = data => {
+                    if (data.questId && data.questId !== quest.id) return;
+                    let progress = quest.config.configVersion === 1 ? data.userStatus.streamProgressSeconds : Math.floor(data.userStatus.progress.PLAY_ON_DESKTOP.value);
+                    this.log(`[${questName}] ${progress}/${secondsNeeded}`);
+                    if (progress >= secondsNeeded || this.aborted) {
+                        this.log(`Quest completed! (${questName})`);
+                        this.toast(`Quest completed: ${questName}`, "success");
+                        RunningGameStore.getRunningGames = this.originals.getRunningGames;
+                        RunningGameStore.getGameForPID = this.originals.getGameForPID;
+                        this.originals = {};
+                        FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [fakeGame], added: [], games: [] });
+                        FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
+                        done();
+                    }
+                };
+                FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
+                this.log(`Spoofed game to ${appData.name}. Wait ~${Math.ceil((secondsNeeded - secondsDone) / 60)} min.`);
+            } else if (taskName === "STREAM_ON_DESKTOP") {
+                if (!isApp) {
+                    this.log(`"${questName}" needs the Discord desktop app.`);
+                    done(); return;
+                }
+                if (!this.originals.getStreamerActiveStreamMetadata) {
+                    this.originals.getStreamerActiveStreamMetadata = ApplicationStreamingStore.getStreamerActiveStreamMetadata;
+                }
+                ApplicationStreamingStore.getStreamerActiveStreamMetadata = () => ({ id: applicationId, pid, sourceName: null });
+                const fn = data => {
+                    if (data.questId && data.questId !== quest.id) return;
+                    let progress = quest.config.configVersion === 1 ? data.userStatus.streamProgressSeconds : Math.floor(data.userStatus.progress.STREAM_ON_DESKTOP.value);
+                    this.log(`[${questName}] ${progress}/${secondsNeeded}`);
+                    if (progress >= secondsNeeded || this.aborted) {
+                        this.log(`Quest completed! (${questName})`);
+                        this.toast(`Quest completed: ${questName}`, "success");
+                        ApplicationStreamingStore.getStreamerActiveStreamMetadata = this.originals.getStreamerActiveStreamMetadata;
+                        delete this.originals.getStreamerActiveStreamMetadata;
+                        FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
+                        done();
+                    }
+                };
+                FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
+                this.log(`Spoofed stream to target game. Stream any window in VC for ~${Math.ceil((secondsNeeded - secondsDone) / 60)} min (need 1+ other person in VC).`);
+            } else if (taskName === "PLAY_ACTIVITY") {
+                const channelId = ChannelStore.getSortedPrivateChannels()[0]?.id ?? Object.values(GuildChannelStore.getAllGuilds()).find(x => x != null && x.VOCAL.length > 0).VOCAL[0].channel.id;
+                const streamKey = `call:${channelId}:1`;
+                this.log(`Completing activity quest ${questName}`);
+                while (!this.aborted) {
+                    const res = await api.post({ url: `/quests/${quest.id}/heartbeat`, body: { stream_key: streamKey, terminal: false } });
+                    const progress = res.body.progress.PLAY_ACTIVITY.value;
+                    this.log(`[${questName}] ${progress}/${secondsNeeded}`);
+                    await new Promise(r => setTimeout(r, 20 * 1000));
+                    if (this.aborted) break;
+                    if (progress >= secondsNeeded) {
+                        await api.post({ url: `/quests/${quest.id}/heartbeat`, body: { stream_key: streamKey, terminal: true } });
+                        break;
+                    }
+                }
+                if (!this.aborted) { this.toast(`Quest completed: ${questName}`, "success"); }
+                done();
+            }
+        } catch (e) {
+            console.error(`[QuestAutoSolver] error on ${questName}`, e);
+            this.activeQuests.delete(quest.id);
+        }
+    }
+};
